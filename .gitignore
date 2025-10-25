@@ -1,5 +1,6 @@
 # Rust
 target/
+contracts/target/
 Cargo.lock
 
 # Environment
