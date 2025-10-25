@@ -1,0 +1,514 @@
+# BondBridge Hackathon Project Rules
+
+## Project Context
+
+You are building BondBridge, a lending protocol for the Stellar blockchain that allows tokenized bond holders (BENJI) to use their tokens as collateral for USDC loans. This is for the EasyA x Stellar Harvard Hack-o-Ween hackathon (36 hours, Oct 25-26, 2025).
+
+## Mission Statement
+
+Unlock $496M in Franklin Templeton's BENJI tokens by enabling collateralized credit lines, allowing institutions to access liquidity without selling their yield-bearing bonds.
+
+## Core Technical Stack
+
+- Blockchain: Stellar (Testnet) with Soroban smart contracts
+- Smart Contract Language: Rust (no_std)
+- Frontend: Next.js 14, TypeScript, Tailwind CSS
+- Wallet: Freighter Wallet (Browser Extension)
+- Development Framework: Scaffold Soroban
+- CLI: Stellar CLI (@stellar/cli)
+
+## Environment Setup (.env.local)
+
+```bash
+# Network Configuration
+NEXT_PUBLIC_NETWORK=testnet
+NEXT_PUBLIC_HORIZON_URL=https://horizon-testnet.stellar.org
+NEXT_PUBLIC_SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
+NEXT_PUBLIC_FREIGHTER_NETWORK=TESTNET
+
+# Contract Addresses (UPDATE AFTER DEPLOYMENT)
+NEXT_PUBLIC_BENJI_TOKEN_ADDRESS=TBD_AFTER_DEPLOYMENT
+NEXT_PUBLIC_USDC_TOKEN_ADDRESS=TBD_AFTER_DEPLOYMENT
+NEXT_PUBLIC_CREDIT_LINE_CONTRACT=TBD_AFTER_DEPLOYMENT
+
+# Development Keys (NEVER commit these)
+DEPLOYER_SECRET=S... # Your secret key for deployment
+ALICE_SECRET=S... # Demo user 1
+BOB_SECRET=S... # Demo user 2
+```
+
+````
+
+## Project Structure
+
+```
+bondbridge/
+├── contracts/
+│   ├── credit_line/
+│   │   ├── src/
+│   │   │   └── lib.rs     # Main lending logic
+│   │   └── Cargo.toml
+│   ├── mock_benji/        # Mock BENJI token
+│   │   ├── src/
+│   │   │   └── lib.rs
+│   │   └── Cargo.toml
+│   └── build.sh           # Build all contracts
+├── frontend/
+│   ├── app/
+│   │   ├── layout.tsx
+│   │   ├── page.tsx       # Dashboard
+│   │   ├── credit/page.tsx # Credit management
+│   │   └── api/
+│   ├── components/
+│   │   ├── WalletConnect.tsx
+│   │   ├── DepositForm.tsx
+│   │   └── BorrowForm.tsx
+│   ├── hooks/
+│   │   └── useFreighter.ts
+│   └── lib/
+│       ├── stellar.ts     # SDK setup
+│       └── contracts.ts   # Contract interactions
+├── scripts/
+│   ├── deploy.sh          # Deploy all contracts
+│   ├── setup-tokens.sh    # Create and fund mock tokens
+│   └── demo-scenario.sh   # Run demo transactions
+└── README.md              # CRITICAL: Must have demo video
+```
+
+## Smart Contract Templates
+
+### Core Contract Structure (Rust/Soroban)
+
+```rust
+#![no_std]
+use soroban_sdk::{
+    contract, contractimpl, contracttype,
+    Address, Env, Symbol, token, Map,
+    panic_with_error, contracterror, log
+};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    NotAuthorized = 3,
+    InsufficientCollateral = 4,
+    ExceedsCreditLimit = 5,
+    InsufficientBalance = 6,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct UserPosition {
+    pub collateral: i128,      // BENJI deposited
+    pub borrowed: i128,        // USDC borrowed
+    pub last_update: u64,      // Timestamp for interest
+}
+
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    BenjiToken,
+    UsdcToken,
+    UserPosition(Address),
+    InterestRate,    // Store as basis points (500 = 5%)
+    LtvRatio,        // Store as basis points (7000 = 70%)
+}
+
+#[contract]
+pub struct CreditLineContract;
+
+#[contractimpl]
+impl CreditLineContract {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        benji_token: Address,
+        usdc_token: Address,
+    ) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::BenjiToken, &benji_token);
+        env.storage().instance().set(&DataKey::UsdcToken, &usdc_token);
+        env.storage().instance().set(&DataKey::InterestRate, &500_u32); // 5%
+        env.storage().instance().set(&DataKey::LtvRatio, &7000_u32); // 70%
+
+        Ok(())
+    }
+
+    pub fn deposit_collateral(env: Env, user: Address, amount: i128) -> Result<(), Error> {
+        user.require_auth();
+
+        // Get token client
+        let benji_token = env.storage().instance()
+            .get(&DataKey::BenjiToken)
+            .ok_or(Error::NotInitialized)?;
+        let token_client = token::Client::new(&env, &benji_token);
+
+        // Transfer BENJI from user to contract
+        token_client.transfer(&user, &env.current_contract_address(), &amount);
+
+        // Update user position
+        let mut position = env.storage().persistent()
+            .get(&DataKey::UserPosition(user.clone()))
+            .unwrap_or(UserPosition {
+                collateral: 0,
+                borrowed: 0,
+                last_update: env.ledger().timestamp(),
+            });
+
+        position.collateral += amount;
+        env.storage().persistent()
+            .set(&DataKey::UserPosition(user), &position);
+
+        log!(&env, "Deposit: {} BENJI from {}", amount, user);
+        Ok(())
+    }
+
+    pub fn borrow(env: Env, user: Address, amount: i128) -> Result<(), Error> {
+        user.require_auth();
+
+        // Get user position
+        let mut position = env.storage().persistent()
+            .get(&DataKey::UserPosition(user.clone()))
+            .ok_or(Error::InsufficientCollateral)?;
+
+        // Calculate credit limit (70% of collateral)
+        let ltv_ratio = env.storage().instance()
+            .get(&DataKey::LtvRatio)
+            .unwrap_or(7000_u32);
+        let credit_limit = (position.collateral * ltv_ratio as i128) / 10000;
+
+        // Check if borrow amount is within limit
+        if position.borrowed + amount > credit_limit {
+            return Err(Error::ExceedsCreditLimit);
+        }
+
+        // Transfer USDC to user
+        let usdc_token = env.storage().instance()
+            .get(&DataKey::UsdcToken)
+            .ok_or(Error::NotInitialized)?;
+        let token_client = token::Client::new(&env, &usdc_token);
+        token_client.transfer(&env.current_contract_address(), &user, &amount);
+
+        // Update position
+        position.borrowed += amount;
+        position.last_update = env.ledger().timestamp();
+        env.storage().persistent()
+            .set(&DataKey::UserPosition(user), &position);
+
+        Ok(())
+    }
+
+    pub fn get_user_position(env: Env, user: Address) -> UserPosition {
+        env.storage().persistent()
+            .get(&DataKey::UserPosition(user))
+            .unwrap_or(UserPosition {
+                collateral: 0,
+                borrowed: 0,
+                last_update: env.ledger().timestamp(),
+            })
+    }
+}
+```
+
+### Mock BENJI Token Setup
+
+```bash
+# Deploy standard token contract
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/soroban_token_contract.wasm \
+  --source $DEPLOYER_SECRET \
+  --network testnet
+
+# Initialize with 18 decimals (like real BENJI)
+stellar contract invoke \
+  --id $TOKEN_CONTRACT_ID \
+  --source $DEPLOYER_SECRET \
+  --network testnet \
+  -- initialize \
+  --admin $DEPLOYER_ADDRESS \
+  --decimal 7 \
+  --name "Franklin Templeton BENJI" \
+  --symbol "BENJI"
+
+# Mint tokens for testing
+stellar contract invoke \
+  --id $TOKEN_CONTRACT_ID \
+  --source $DEPLOYER_SECRET \
+  --network testnet \
+  -- mint \
+  --to $ALICE_ADDRESS \
+  --amount 10000000000  # 1000 BENJI
+```
+
+## Frontend Implementation
+
+### Freighter Wallet Connection
+
+```typescript
+// hooks/useFreighter.ts
+import { useState, useEffect } from "react";
+import {
+  requestAccess,
+  signTransaction,
+  isConnected,
+  getPublicKey,
+  getNetworkDetails,
+} from "@stellar/freighter-api";
+
+export const useFreighter = () => {
+  const [connected, setConnected] = useState(false);
+  const [publicKey, setPublicKey] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    checkConnection();
+  }, []);
+
+  const checkConnection = async () => {
+    try {
+      const connected = await isConnected();
+      if (connected) {
+        const pubKey = await getPublicKey();
+        const network = await getNetworkDetails();
+
+        if (network.network !== "TESTNET") {
+          alert("Please switch Freighter to Testnet");
+          return;
+        }
+
+        setPublicKey(pubKey);
+        setConnected(true);
+      }
+    } catch (e) {
+      console.error("Freighter error:", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const connect = async () => {
+    try {
+      await requestAccess();
+      await checkConnection();
+    } catch (e) {
+      alert("Please install Freighter wallet extension");
+    }
+  };
+
+  return { connected, publicKey, loading, connect };
+};
+```
+
+### Contract Interaction
+
+```typescript
+// lib/contracts.ts
+import {
+  Contract,
+  SorobanRpc,
+  TransactionBuilder,
+  Networks,
+  BASE_FEE,
+  Operation,
+  Asset,
+  nativeToScVal,
+  Address,
+} from "@stellar/sdk";
+
+const server = new SorobanRpc.Server(process.env.NEXT_PUBLIC_SOROBAN_RPC_URL!);
+
+export async function depositCollateral(userPublicKey: string, amount: bigint) {
+  const contract = new Contract(process.env.NEXT_PUBLIC_CREDIT_LINE_CONTRACT!);
+
+  const tx = new TransactionBuilder(await server.getAccount(userPublicKey), {
+    fee: BASE_FEE,
+    networkPassphrase: Networks.TESTNET,
+  })
+    .addOperation(
+      contract.call(
+        "deposit_collateral",
+        nativeToScVal(Address.fromString(userPublicKey)),
+        nativeToScVal(amount, { type: "i128" })
+      )
+    )
+    .setTimeout(30)
+    .build();
+
+  // Sign with Freighter
+  const signedTx = await signTransaction(tx.toXDR());
+
+  // Submit transaction
+  const result = await server.sendTransaction(
+    TransactionBuilder.fromXDR(signedTx, Networks.TESTNET)
+  );
+
+  return result;
+}
+```
+
+## Priority Timeline (36 Hours)
+
+### Phase 1: Setup & Contracts (Hours 0-8)
+
+- [ ] Hour 0-1: Environment setup, create accounts, get testnet XLM
+- [ ] Hour 1-2: Deploy mock BENJI and USDC tokens
+- [ ] Hour 2-4: Write CreditLineContract with deposit/borrow
+- [ ] Hour 4-6: Test contracts locally
+- [ ] Hour 6-8: Deploy to testnet and verify
+
+### Phase 2: Core Frontend (Hours 8-16)
+
+- [ ] Hour 8-10: Next.js setup with Freighter integration
+- [ ] Hour 10-12: Deposit collateral UI
+- [ ] Hour 12-14: Borrow/Repay UI
+- [ ] Hour 14-16: Position display dashboard
+
+### Phase 3: Polish & Demo (Hours 16-36)
+
+- [ ] Hour 16-20: Error handling and loading states
+- [ ] Hour 20-24: UI polish with Tailwind
+- [ ] Hour 24-28: Record demo video
+- [ ] Hour 28-32: Create Canva presentation
+- [ ] Hour 32-36: Final testing and submission
+
+## Constants and Key Values
+
+```typescript
+// Protocol Parameters
+export const PROTOCOL_CONFIG = {
+  LTV_RATIO: 0.7, // 70% loan-to-value
+  INTEREST_RATE: 0.05, // 5% annual
+  LIQUIDATION_THRESHOLD: 1.1, // 110% collateralization
+  MIN_DEPOSIT: 100_0000000, // 100 BENJI minimum
+  MIN_BORROW: 10_0000000, // 10 USDC minimum
+};
+
+// UI Display Helpers
+export const formatAmount = (stroops: bigint, decimals = 7): string => {
+  return (Number(stroops) / Math.pow(10, decimals)).toFixed(2);
+};
+```
+
+## Testing Commands
+
+```bash
+# Build contracts
+cd contracts/credit_line && cargo build --target wasm32-unknown-unknown --release
+
+# Run tests
+cargo test -- --nocapture
+
+# Deploy to testnet
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/credit_line.wasm \
+  --source $DEPLOYER_SECRET \
+  --network testnet
+
+# Test deposit function
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source $ALICE_SECRET \
+  --network testnet \
+  -- deposit_collateral \
+  --user $ALICE_ADDRESS \
+  --amount 1000000000
+```
+
+## Common Issues & Solutions
+
+### Issue: "Contract not initialized"
+
+```typescript
+// Always initialize contract after deployment
+await initializeContract(admin, benjiToken, usdcToken);
+```
+
+### Issue: "Insufficient XLM for fees"
+
+```bash
+# Get more testnet XLM
+curl "https://friendbot.stellar.org?addr=$YOUR_ADDRESS"
+```
+
+### Issue: "Transaction too large"
+
+```rust
+// Split complex operations into multiple transactions
+// Keep contract functions focused and simple
+```
+
+### Issue: "Freighter not connecting"
+
+```typescript
+// Check network configuration
+if (network !== "TESTNET") {
+  alert("Please switch to Testnet in Freighter settings");
+}
+```
+
+## Demo Must-Haves
+
+1. ✅ Working deposit of mock BENJI tokens
+2. ✅ Successful USDC borrow showing credit limit
+3. ✅ Display: Available Credit = (Collateral × 0.7) - Borrowed
+4. ✅ Clean UI that doesn't crash during demo
+5. ✅ Transaction history showing deposits and borrows
+6. ✅ Video backup of everything working
+
+## Pitch Key Points
+
+- Problem: $496M in BENJI tokens are completely illiquid
+- Solution: Collateralized credit lines at 70% LTV
+- Impact: Unlock $347M in potential liquidity
+- Differentiator: First institutional lending on Stellar
+- Vision: Expand to all RWAs on Stellar ($3B target)
+
+## Emergency Fallbacks
+
+- If BENJI mock fails: Use wrapped XLM as collateral
+- If borrow fails: Show deposit working and calculate theoretical credit
+- If Freighter issues: Use Stellar CLI for demo
+- If testnet is slow: Have local recordings ready
+- If UI breaks: Show contract calls via CLI
+
+## Judges Scoring Criteria (Focus Areas)
+
+- **Stellar Integration** (HIGH): Deep use of Soroban
+- **Technical Implementation** (HIGH): Working contracts on testnet
+- **Innovation**: Novel approach to RWA liquidity
+- **Impact Potential**: Path to $1.5B TVL goal
+- **Blockchain Use Case**: Why this needs blockchain
+- **Demo Quality**: Clear, working demonstration
+
+## Submission Requirements
+
+1. GitHub repo with all code (public)
+2. README with demo video and screenshots
+3. Deployed contracts on testnet with explorer links
+4. Canva presentation following template
+5. Short summary (<150 chars)
+6. Technical description of Stellar usage
+
+## External Resources
+
+- Stellar Laboratory: https://laboratory.stellar.org
+- Soroban Examples: https://github.com/stellar/soroban-examples
+- Freighter Docs: https://docs.freighter.app
+- Stellar Discord: [Join for mentor help during hackathon]
+
+## Remember
+
+- Simple and working > complex and broken
+- Judges want to see Stellar-specific features
+- Focus on unlocking BENJI value as primary narrative
+- Have backup demo video ready before live presentation
+- Commit to GitHub every 2 hours for backup
+- The 70% LTV credit line IS the innovation - keep it simple
+````

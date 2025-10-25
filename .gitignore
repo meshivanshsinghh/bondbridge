@@ -1,0 +1,20 @@
+# Rust
+target/
+Cargo.lock
+
+# Environment
+.env
+.env.local
+
+# Temp files
+temp_soroban_examples/
+
+# Node
+node_modules/
+.next/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
