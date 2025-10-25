@@ -24,3 +24,11 @@ d49bdbec4233dba3498ecfbbe8378897bddf581dae9723f6330030a557643fa2
 
 Minting/Transfering 50,000 USDC to credit line for lending with id: 
 1b434bce8b9997a3425cff20e5f7802253d0fbe0900f1507bfb5409307abea68
+
+
+
+to view our benji token or other token we can use this: 
+https://stellar.expert/explorer/testnet/contract/<contract_id>
+
+to view account we can use this: 
+https://stellar.expert/explorer/testnet/account/<ALICE_ADDRESS>
